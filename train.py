@@ -9,17 +9,17 @@ import random
 from env import BuildingEnv
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
-EPISODES      = 30_000      # 3x more -> cold/uncommon states get visited
+EPISODES      = 50_000      # 3x more -> cold/uncommon states get visited
 ALPHA         = 0.1         # learning rate
 GAMMA         = 0.95        # discount factor
 EPSILON_START = 1.0
 EPSILON_END   = 0.05
-EPSILON_DECAY = 0.9998      # slower decay: hits 0.05 at ~ep 19,000
+EPSILON_DECAY = 0.9999      # slower decay: hits 0.05 at ~ep 19,000
                             # -> last 11k episodes are quality exploitation
 
 # Q-table: (temp_bin=20, occupancy=2, time_bin=8, price_bin=6, actions=2)
 # Total cells: 20 x 2 x 8 x 6 x 2 = 3,840
-# With 30k eps x 24 steps = 720,000 updates -> ~188 updates per cell on average
+# With 50k eps x 24 steps = 1,200,000 updates -> ~300 updates per cell on average
 Q = np.zeros((20, 2, 8, 6, 2))
 
 epsilon    = EPSILON_START

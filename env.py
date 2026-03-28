@@ -27,7 +27,7 @@ class BuildingEnv:
     ]
 
     # Raise this -> agent cares more about comfort vs saving money
-    COMFORT_WEIGHT = 1.5
+    COMFORT_WEIGHT = 2.5
 
     # Probability per step that occupancy flips (training only)
     OCC_FLIP_PROB = 0.08
