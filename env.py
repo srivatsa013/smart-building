@@ -47,7 +47,7 @@ class BuildingEnv:
             self.indoor_temp = self.initial_temp if self.initial_temp is not None else random.uniform(24, 30)
             self.occupancy   = self.initial_occupancy if self.initial_occupancy is not None else random.randint(0, 1)
 
-        self.time  = 0
+        self.time  = random.randint(0, 23)
         self.price = self.PRICE_PROFILE[0]
         return self.get_state()
 
