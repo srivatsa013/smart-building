@@ -120,9 +120,9 @@ smart-building/
 
 **BCSE432E — Reinforcement Learning, VIT Vellore**
 
-| Name | Registration No. |
-|------|-----------------|
-| Hitakshi Sardana | 23BAI0145 |
-| Vaishali Chitipothu | 23BAI0159 |
-| Srivatsa Singaraju | 23BAI0082 |
-| Kush Agrawal | 23BAI0024 |
+| Name |
+|------|
+| Hitakshi Sardana |
+| Vaishali Chitipothu |
+| Srivatsa Singaraju |
+| Kush Agrawal |
