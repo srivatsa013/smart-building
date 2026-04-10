@@ -12,12 +12,16 @@ class BuildingEnv:
 
     Training mode  (training=True)       -> randomised start + noisy conditions
     Simulation mode (initial_temp=value) -> fixed, deterministic for the app
+
+    Temperature binning covers 20–45°C (Vellore summer range) in 20 bins of 1.25°C each.
     """
 
+    # Realistic Vellore summer day profile (April–May):
+    # Min ~25°C at 3–4 am, peak ~41°C at noon–1 pm.
     OUTDOOR_TEMPS = [
-        22, 21, 21, 20, 20, 21, 23, 26,
-        28, 30, 32, 33, 34, 34, 33, 32,
-        31, 30, 28, 27, 26, 25, 24, 23,
+        27, 26, 26, 25, 25, 26, 28, 31,
+        34, 37, 39, 40, 41, 41, 40, 39,
+        37, 35, 33, 31, 30, 29, 28, 27,
     ]
 
     PRICE_PROFILE = [
@@ -32,35 +36,44 @@ class BuildingEnv:
     # Probability per step that occupancy flips (training only)
     OCC_FLIP_PROB = 0.08
 
-    def __init__(self, initial_temp=None, initial_occupancy=None, training=False):
+    def __init__(self, initial_temp=None, initial_occupancy=None, training=False,
+                 outdoor_temps=None, price_profile=None):
         self.initial_temp      = initial_temp
         self.initial_occupancy = initial_occupancy
         self.training          = training
+        # Support custom profiles for dynamic/API mode
+        self._outdoor_temps = outdoor_temps if outdoor_temps is not None else self.OUTDOOR_TEMPS
+        self._price_profile = price_profile if price_profile is not None else self.PRICE_PROFILE
         self.reset()
 
     def reset(self):
         if self.training:
             # Cover the FULL state space so every Q-table cell gets visited
-            self.indoor_temp = random.uniform(18, 36)
-            self.occupancy   = random.randint(0, 1)
+            self.indoor_temp     = random.uniform(20, 43)
+            self.occupancy_level = random.random()
+            self.occupancy       = random.randint(0, 1)
+            self.time            = random.randint(0, 23)
         else:
-            self.indoor_temp = self.initial_temp if self.initial_temp is not None else random.uniform(24, 30)
-            self.occupancy   = self.initial_occupancy if self.initial_occupancy is not None else random.randint(0, 1)
+            self.indoor_temp = self.initial_temp if self.initial_temp is not None else random.uniform(26, 34)
+            occ = self.initial_occupancy if self.initial_occupancy is not None else 1.0
+            self.occupancy_level = float(occ)
+            self.occupancy       = 1 if self.occupancy_level >= 0.5 else 0
+            self.time            = 0   # Always start at hour 0 for a full 24-hour simulation
 
-        self.time  = random.randint(0, 23)
-        self.price = self.PRICE_PROFILE[0]
+        self.price = self._price_profile[self.time % 24]
         return self.get_state()
 
     def get_state(self):
-        temp_bin  = int(np.clip(self.indoor_temp - 18, 0, 19))
+        # temp_bin covers 20–45°C in 20 bins of 1.25°C each
+        temp_bin  = int(np.clip((self.indoor_temp - 20) / 1.25, 0, 19))
         time_bin  = min(self.time // 3, 7)
         price_bin = int(np.clip((self.price - 2) // 1.5, 0, 5))
         return (temp_bin, self.occupancy, time_bin, price_bin)
 
     def step(self, action):
         hour        = self.time % 24
-        outdoor_raw = self.OUTDOOR_TEMPS[hour]
-        price_raw   = self.PRICE_PROFILE[hour]
+        outdoor_raw = self._outdoor_temps[hour]
+        price_raw   = self._price_profile[hour]
 
         # Add noise during training -> agent learns a GENERAL policy
         if self.training:
@@ -78,11 +91,13 @@ class BuildingEnv:
             self.indoor_temp += 0.25 * (outdoor_temp - self.indoor_temp)
             energy = 0.0
 
-        self.indoor_temp = float(np.clip(self.indoor_temp, 15, 40))
+        # Clamp to realistic indoor range for Vellore conditions
+        self.indoor_temp = float(np.clip(self.indoor_temp, 15, 45))
 
-        # Comfort penalty (target 22-24 degC)
+        # Comfort penalty (target 22–24°C)
+        # occ_multiplier scales linearly: 0% occupancy → 0.5, 100% → 2.0
         raw_comfort     = max(0.0, self.indoor_temp - 24) + max(0.0, 22 - self.indoor_temp)
-        occ_multiplier  = 2.0 if self.occupancy == 1 else 0.5
+        occ_multiplier  = 0.5 + self.occupancy_level * 1.5
         comfort_penalty = raw_comfort * occ_multiplier
 
         # Cost
@@ -95,13 +110,13 @@ class BuildingEnv:
         done = self.time >= 24
 
         # Stochastic occupancy flip during training
-        if self.training and self.initial_occupancy is None:
-            if random.random() < self.OCC_FLIP_PROB:
-                self.occupancy = 1 - self.occupancy
+        if self.training and random.random() < self.OCC_FLIP_PROB:
+            self.occupancy       = 1 - self.occupancy
+            self.occupancy_level = float(self.occupancy)
 
         return self.get_state(), reward, done, energy, self.indoor_temp, cost, comfort_penalty
 
 
 def rule_based_action(temp):
-    """Simple threshold controller: cool if above 25 degC."""
+    """Simple threshold controller: cool if above 25°C."""
     return 1 if temp > 25 else 0

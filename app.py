@@ -5,10 +5,17 @@ Needs:  q_table.npy  (run python train.py first)
 """
 
 import os
+import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
 from env import BuildingEnv, rule_based_action
 
 # ── page config ──────────────────────────────────────────────────────────────
@@ -19,8 +26,33 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-OUTDOOR_TEMPS = [22,21,21,20,20,21,23,26,28,30,32,33,34,34,33,32,31,30,28,27,26,25,24,23]
+# Vellore summer day: min ~25°C at 3–4 am, peak ~41°C at noon–1 pm
+OUTDOOR_TEMPS = [27,26,26,25,25,26,28,31,34,37,39,40,41,41,40,39,37,35,33,31,30,29,28,27]
 PRICE_PROFILE = [2,2,2,2,2,3,4,6,7,8,8,9,9,8,8,7,7,8,9,8,6,4,3,2]
+
+# India residential time-of-use electricity tariff (₹/unit, same numeric scale as PRICE_PROFILE)
+# Night off-peak (00-05): 3 | Morning/day (06-11): 5-6 | Afternoon (12-17): 6-7 | Evening peak (18-21): 9 | Taper (22-23): 6-4
+INDIA_PRICE_PROFILE = [3,3,3,3,3,3, 5,6,6,6,6,6, 6,6,7,7,7,7, 9,9,9,8,6,4]
+
+
+def _fetch_city_temp(city: str, api_key: str):
+    """Return (current_temp_celsius, resolved_city_name).
+    Raises on network or API error."""
+    resp = _requests.get(
+        "https://api.openweathermap.org/data/2.5/weather",
+        params={"q": city, "appid": api_key, "units": "metric"},
+        timeout=6,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return float(data["main"]["temp"]), data["name"]
+
+
+def _build_dynamic_outdoor_profile(current_temp: float, current_hour: int):
+    """Shift the default 24-h profile to match the live current temperature,
+    keeping the same diurnal shape."""
+    offset = current_temp - OUTDOOR_TEMPS[current_hour]
+    return [round(t + offset, 1) for t in OUTDOOR_TEMPS]
 
 # ── design tokens ─────────────────────────────────────────────────────────────
 BG        = "#0A0E1A"
@@ -95,7 +127,7 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] > div {{
 div[data-testid="stToolbar"] {{ display: none; }}
 
 /* metric cards */
-.kpi-grid {{ display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin: 20px 0; }}
+.kpi-grid {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin: 20px 0; }}
 .kpi-card {{
     background: {SURFACE};
     border: 1px solid {BORDER};
@@ -225,11 +257,15 @@ div {{ font-size: 13px; }}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-def run_simulation(q_table, initial_temp, initial_price, occupancy):
+def run_simulation(q_table, initial_temp, occupancy, outdoor_temps, price_profile):
     def _run(use_rl):
-        env = BuildingEnv(initial_temp=initial_temp, initial_occupancy=occupancy)
-        env.reset()
-        env.price = initial_price
+        env = BuildingEnv(
+            initial_temp=initial_temp,
+            initial_occupancy=occupancy,
+            outdoor_temps=outdoor_temps,
+            price_profile=price_profile,
+        )
+        env.reset()   # time is set to 0 in non-training mode
         state = env.get_state()
         done  = False
         rows  = []
@@ -292,6 +328,28 @@ def delta_chip(rl_val, rule_val, lower_better=True):
     return f'<span class="kpi-delta {cls}">{label}</span>'
 
 
+def _ac_card_html(controller, action, indoor_temp, outdoor_temp, note):
+    """Render a single AC status card for a specific hour."""
+    is_on      = action == "ON"
+    card_css   = "on" if is_on else "off"
+    icon       = "❄️" if is_on else "🌤️"
+    tag_color  = ACCENT if is_on else MUTED
+    return f"""
+    <div class="ac-card {card_css}" style="margin-bottom:8px">
+      <div class="ac-icon">{icon}</div>
+      <div style="flex:1">
+        <div class="ac-who">{controller}</div>
+        <div class="ac-tag {card_css}" style="font-size:18px;font-weight:700">AC {action}</div>
+        <div class="ac-info" style="margin-top:6px">
+          Indoor (entering)&nbsp;<strong style="color:{TEXT}">{indoor_temp:.1f}°C</strong>
+          &nbsp;·&nbsp;
+          Outdoor&nbsp;<strong style="color:{MUTED}">{outdoor_temp}°C</strong>
+        </div>
+        <div style="font-size:11px;color:{MUTED};margin-top:4px;letter-spacing:.02em">{note}</div>
+      </div>
+    </div>"""
+
+
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(f"""
@@ -305,13 +363,77 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown(f'<div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:{MUTED};margin-bottom:8px">Simulation Parameters</div>', unsafe_allow_html=True)
+    # ── Input mode toggle ─────────────────────────────────────────────────────
+    st.markdown(f'<div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:{MUTED};margin-bottom:6px">Input Mode</div>', unsafe_allow_html=True)
+    input_mode = st.radio(
+        "_mode",
+        ["Manual", "Dynamic (API)"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.markdown(f'<hr style="border:none;border-top:1px solid {BORDER};margin:12px 0"/>', unsafe_allow_html=True)
 
-    initial_temp  = st.slider("Indoor Start Temp (°C)", 18, 38, 28)
-    initial_price = st.slider("Starting Energy Price",   2,  9,  5)
-    occupancy     = st.selectbox("Occupancy",
-                                 [1, 0],
-                                 format_func=lambda x: "Occupied" if x == 1 else "Empty")
+    # ── Manual mode ───────────────────────────────────────────────────────────
+    if input_mode == "Manual":
+        st.markdown(f'<div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:{MUTED};margin-bottom:8px">Simulation Parameters</div>', unsafe_allow_html=True)
+        initial_temp      = st.slider("Indoor Start Temp (°C)", 20, 42, 30)
+        outdoor_temps_sim = OUTDOOR_TEMPS
+        price_profile_sim = INDIA_PRICE_PROFILE
+
+    # ── Dynamic API mode ──────────────────────────────────────────────────────
+    else:
+        st.markdown(f'<div style="font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:{MUTED};margin-bottom:8px">Live Weather (OpenWeatherMap)</div>', unsafe_allow_html=True)
+
+        city    = st.text_input("City", value="Vellore",
+                                placeholder="e.g. Mumbai, Chennai, Delhi")
+        api_key = st.text_input("API Key", type="password",
+                                help="Free key from openweathermap.org — register, go to API keys, copy it here.")
+
+        fetch_btn = st.button("⬇  Fetch Live Weather", use_container_width=True,
+                              disabled=not _REQUESTS_OK)
+        if not _REQUESTS_OK:
+            st.caption("Install `requests` to enable: `pip install requests`")
+
+        if fetch_btn:
+            if not api_key.strip():
+                st.warning("Paste your OpenWeatherMap API key above first.")
+            else:
+                with st.spinner("Fetching…"):
+                    try:
+                        cur_temp, resolved = _fetch_city_temp(city.strip(), api_key.strip())
+                        cur_hour           = datetime.datetime.now().hour
+                        dyn_profile        = _build_dynamic_outdoor_profile(cur_temp, cur_hour)
+                        st.session_state["dyn_outdoor"] = dyn_profile
+                        st.session_state["dyn_city"]    = resolved
+                        st.session_state["dyn_temp"]    = round(cur_temp, 1)
+                    except Exception as exc:
+                        st.error(f"Could not fetch: {exc}")
+
+        if "dyn_outdoor" in st.session_state:
+            st.markdown(
+                f'<div style="font-size:12px;color:{GREEN};margin:6px 0 4px">'
+                f'● {st.session_state["dyn_city"]} · {st.session_state["dyn_temp"]}°C live</div>',
+                unsafe_allow_html=True,
+            )
+            outdoor_temps_sim = st.session_state["dyn_outdoor"]
+        else:
+            st.caption("Enter city + key and click Fetch to load real temperatures.")
+            outdoor_temps_sim = OUTDOOR_TEMPS
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        _default_temp = int(st.session_state.get("dyn_temp", 30))
+        _default_temp = max(20, min(42, _default_temp))
+        initial_temp      = st.slider("Indoor Start Temp (°C)", 20, 42, _default_temp)
+        price_profile_sim = INDIA_PRICE_PROFILE
+
+    # ── Occupancy (always shown) ───────────────────────────────────────────────
+    occ_pct   = st.select_slider(
+        "Occupancy",
+        options=[0, 25, 50, 75, 100],
+        value=100,
+        format_func=lambda x: f"{x}%",
+    )
+    occupancy = occ_pct / 100.0   # float 0.0–1.0 passed to env
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -370,6 +492,36 @@ if not q_exists:
 
 Q = np.load("q_table.npy")
 
+# ── how it works (permanent collapsible) ─────────────────────────────────────
+with st.expander("💡  How It Works", expanded=False):
+    c1, c2, c3, c4 = st.columns(4)
+    cards = [
+        (c1, "01", "Observe",
+         f"The agent reads 4 inputs every hour: indoor temperature, occupancy level, time of day, and electricity price — forming one of 3,840 possible states.",
+         ACCENT),
+        (c2, "02", "Decide",
+         f"The trained Q-table looks up the current state and selects the action (AC ON or OFF) with the highest expected future reward.",
+         ACCENT),
+        (c3, "03", "Act",
+         f"The HVAC system executes the decision. AC ON cools the room by 1.2°C/hour; AC OFF lets the room exchange heat naturally with outdoors.",
+         ACCENT2),
+        (c4, "04", "Learn",
+         f"During training, a reward signal (−cost − 2.5×discomfort) updated the Q-table via the Bellman equation across 100,000 episodes.",
+         GREEN),
+    ]
+    for col, num, title, desc, color in cards:
+        with col:
+            st.markdown(f"""
+            <div style="background:{SURFACE2};border:1px solid {BORDER};border-radius:10px;
+                        padding:18px 16px;position:relative;overflow:hidden;">
+              <div style="font-family:{FONT_MONO};font-size:28px;font-weight:700;
+                          color:{BORDER};position:absolute;top:8px;right:12px;line-height:1">{num}</div>
+              <div style="font-family:{FONT_DISP};font-size:16px;font-weight:700;
+                          text-transform:uppercase;color:{color};margin-bottom:8px">{title}</div>
+              <div style="font-size:12px;color:{TEXT2};line-height:1.6">{desc}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
 # ── training curve expander ───────────────────────────────────────────────────
 if os.path.exists("rewards_log.npy"):
     with st.expander("📈  Training Convergence Curve", expanded=False):
@@ -393,8 +545,10 @@ if os.path.exists("rewards_log.npy"):
             height=220,
             xaxis=ax("Episode"),
             yaxis=ax("Total reward"),
-            title=dict(text="Agent learns over time — reward rises toward 0",
-                       font=dict(size=12, color=MUTED), x=0),
+            title=dict(
+                text="Q-Learning convergence — reward improves as the agent learns better cooling decisions (higher = better, closer to 0 = optimal)",
+                font=dict(size=11, color=MUTED), x=0,
+            ),
         )
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         c1, c2, c3 = st.columns(3)
@@ -405,35 +559,34 @@ if os.path.exists("rewards_log.npy"):
 # ── run ──────────────────────────────────────────────────────────────────────
 if run_btn:
     with st.spinner(""):
-        df_rl, df_rule = run_simulation(Q, initial_temp, initial_price, occupancy)
-    st.session_state["df_rl"]   = df_rl
-    st.session_state["df_rule"] = df_rule
+        df_rl, df_rule = run_simulation(
+            Q, initial_temp, occupancy, outdoor_temps_sim, price_profile_sim,
+        )
+    st.session_state["df_rl"]           = df_rl
+    st.session_state["df_rule"]         = df_rule
+    st.session_state["outdoor_temps"]   = outdoor_temps_sim
+    st.session_state["price_profile"]   = price_profile_sim
 
 if "df_rl" not in st.session_state:
-    st.markdown(f'<div class="sec-label">How it works</div>', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    cards = [
-        (c1, "01", "Observe", f"Agent reads temp, occupancy, time of day, and energy price — 3,840 possible states", ACCENT),
-        (c2, "02", "Decide",  f"Q-table selects the action (AC ON / OFF) with the highest expected future reward",    ACCENT),
-        (c3, "03", "Act",     f"HVAC is controlled — room temperature and energy consumption update accordingly",     ACCENT2),
-        (c4, "04", "Learn",   f"Reward signal (cost + discomfort) updates the Q-table via the Bellman equation",      GREEN),
-    ]
-    for col, num, title, desc, color in cards:
-        with col:
-            st.markdown(f"""
-            <div style="background:{SURFACE};border:1px solid {BORDER};border-radius:12px;
-                        padding:20px 18px;height:180px;position:relative;overflow:hidden;">
-              <div style="font-family:{FONT_MONO};font-size:36px;font-weight:700;
-                          color:{BORDER};position:absolute;top:10px;right:14px;line-height:1">{num}</div>
-              <div style="font-family:{FONT_DISP};font-size:18px;font-weight:700;
-                          text-transform:uppercase;color:{color};margin-bottom:10px">{title}</div>
-              <div style="font-size:13px;color:{TEXT2};line-height:1.6">{desc}</div>
-            </div>
-            """, unsafe_allow_html=True)
+    st.markdown(f"""
+    <div style="margin:56px auto;max-width:420px;text-align:center;padding:40px 32px;
+                background:{SURFACE};border:1px solid {BORDER};border-radius:16px;">
+      <div style="font-size:40px;margin-bottom:16px">🏢</div>
+      <div style="font-family:{FONT_DISP};font-size:20px;font-weight:700;letter-spacing:.04em;
+                  text-transform:uppercase;color:{TEXT};margin-bottom:10px">Ready to Simulate</div>
+      <div style="font-size:13px;color:{MUTED};line-height:1.8">
+        Configure parameters in the sidebar, then click
+        <strong style="color:{ACCENT}">▶ Run Simulation</strong>
+        to see the RL vs rule-based comparison.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
     st.stop()
 
-df_rl   = st.session_state["df_rl"]
-df_rule = st.session_state["df_rule"]
+df_rl              = st.session_state["df_rl"]
+df_rule            = st.session_state["df_rule"]
+outdoor_temps_disp = st.session_state.get("outdoor_temps", OUTDOOR_TEMPS)
+price_profile_disp = st.session_state.get("price_profile", INDIA_PRICE_PROFILE)
 
 # ── compute totals ────────────────────────────────────────────────────────────
 rl_energy   = df_rl["Energy"].sum()
@@ -469,84 +622,100 @@ else:
 st.markdown(f'<div class="insight {ins_cls}">{ins_msg}</div>', unsafe_allow_html=True)
 
 # ── KPI cards ─────────────────────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Performance Summary</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="sec-label">24-Hour Results at a Glance — RL vs Rule-Based</div>', unsafe_allow_html=True)
 
 st.markdown(f"""
 <div class="kpi-grid">
 
   <div class="kpi-card rl">
-    <div class="kpi-label">⚡ Energy Used · RL</div>
+    <div class="kpi-label">⚡ Total Energy Consumed</div>
     <div class="kpi-value">{rl_energy:.1f}<span style="font-size:14px;color:{MUTED}"> kWh</span></div>
-    <div class="kpi-sub">Rule-based: {rule_energy:.1f} kWh</div>
+    <div class="kpi-sub">RL used {rl_energy:.1f} kWh &nbsp;·&nbsp; Rule-based used {rule_energy:.1f} kWh</div>
     {delta_chip(rl_energy, rule_energy, lower_better=True)}
   </div>
 
   <div class="kpi-card rl">
-    <div class="kpi-label">💰 Total Cost · RL</div>
-    <div class="kpi-value">{rl_cost:.1f}</div>
-    <div class="kpi-sub">Rule-based: {rule_cost:.1f}</div>
+    <div class="kpi-label">💰 Total Electricity Cost (₹)</div>
+    <div class="kpi-value">₹{rl_cost:.1f}</div>
+    <div class="kpi-sub">RL spent ₹{rl_cost:.1f} &nbsp;·&nbsp; Rule-based spent ₹{rule_cost:.1f}</div>
     {delta_chip(rl_cost, rule_cost, lower_better=True)}
   </div>
 
   <div class="kpi-card rl">
-    <div class="kpi-label">😰 Discomfort Score · RL</div>
+    <div class="kpi-label">😰 Total Comfort Penalty</div>
     <div class="kpi-value">{rl_comfort:.1f}</div>
-    <div class="kpi-sub">Rule-based: {rule_comfort:.1f}</div>
+    <div class="kpi-sub">Lower is better &nbsp;·&nbsp; Rule-based scored {rule_comfort:.1f}</div>
     {delta_chip(rl_comfort, rule_comfort, lower_better=True)}
-  </div>
-
-  <div class="kpi-card win">
-    <div class="kpi-label">🏆 Total Reward · RL</div>
-    <div class="kpi-value">{rl_reward:.1f}</div>
-    <div class="kpi-sub">Rule-based: {rule_reward:.1f}</div>
-    {delta_chip(rl_reward, rule_reward, lower_better=False)}
   </div>
 
 </div>
 """, unsafe_allow_html=True)
 
-# ── AC status ─────────────────────────────────────────────────────────────────
-# FIX: use st.columns instead of a single st.markdown with nested HTML —
-# that caused Streamlit to render the raw HTML as a code block.
-st.markdown(f'<div class="sec-label">Final Hour AC Status</div>', unsafe_allow_html=True)
+# ── AC status at critical moments ─────────────────────────────────────────────
+st.markdown(
+    f'<div class="sec-label">HVAC Decisions at Critical Moments — What Each Controller Actually Did</div>',
+    unsafe_allow_html=True,
+)
 
-final_rl_action   = df_rl["Action"].iloc[-1]
-final_rule_action = df_rule["Action"].iloc[-1]
-final_rl_temp     = df_rl["Temp"].iloc[-1]
-final_rule_temp   = df_rule["Temp"].iloc[-1]
+# Hour 13 = peak outdoor heat | Hour 19 = peak electricity price (₹9/unit)
+# Use temp at end of previous hour as "entering temp" — this is what the controller
+# saw when making its decision, not the post-action result stored in iloc[13/19].
+_h13_rl_a   = df_rl["Action"].iloc[13];   _h13_rl_t   = df_rl["Temp"].iloc[12]
+_h13_rule_a = df_rule["Action"].iloc[13]; _h13_rule_t = df_rule["Temp"].iloc[12]
+_h19_rl_a   = df_rl["Action"].iloc[19];   _h19_rl_t   = df_rl["Temp"].iloc[18]
+_h19_rule_a = df_rule["Action"].iloc[19]; _h19_rule_t = df_rule["Temp"].iloc[18]
+_out13      = outdoor_temps_disp[13]
+_out19      = outdoor_temps_disp[19]
+_pr19       = price_profile_disp[19]
 
-col_rl, col_rule = st.columns(2)
+col_h, col_p = st.columns(2)
 
-with col_rl:
-    rl_css  = "on" if final_rl_action == "ON" else "off"
-    rl_icon = "❄️" if final_rl_action == "ON" else "🌤️"
-    st.markdown(f"""
-    <div class="ac-card {rl_css}">
-      <div class="ac-icon">{rl_icon}</div>
-      <div>
-        <div class="ac-who">🤖 RL Controller</div>
-        <div class="ac-tag {rl_css}">AC {final_rl_action}</div>
-        <div class="ac-info">Indoor temp: <strong style="color:{TEXT}">{final_rl_temp}°C</strong></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+with col_h:
+    st.markdown(
+        f'<div style="font-size:12px;font-weight:700;color:{TEXT2};letter-spacing:.06em;'
+        f'text-transform:uppercase;margin-bottom:10px">'
+        f'🌡️ Hour 13 · 1 pm · Outdoor {_out13}°C (Hottest Point)</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _ac_card_html(
+            "🤖 RL Controller", _h13_rl_a, _h13_rl_t, _out13,
+            "RL weighs cost + comfort — may pre-cool before this hour",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _ac_card_html(
+            "📏 Rule-Based", _h13_rule_a, _h13_rule_t, _out13,
+            "Rule: turn ON if indoor temp > 25°C, regardless of price",
+        ),
+        unsafe_allow_html=True,
+    )
 
-with col_rule:
-    rule_css  = "on" if final_rule_action == "ON" else "off"
-    rule_icon = "❄️" if final_rule_action == "ON" else "🌤️"
-    st.markdown(f"""
-    <div class="ac-card {rule_css}">
-      <div class="ac-icon">{rule_icon}</div>
-      <div>
-        <div class="ac-who">📏 Rule-Based</div>
-        <div class="ac-tag {rule_css}">AC {final_rule_action}</div>
-        <div class="ac-info">Indoor temp: <strong style="color:{TEXT}">{final_rule_temp}°C</strong></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+with col_p:
+    st.markdown(
+        f'<div style="font-size:12px;font-weight:700;color:{TEXT2};letter-spacing:.06em;'
+        f'text-transform:uppercase;margin-bottom:10px">'
+        f'⚡ Hour 19 · 7 pm · ₹{_pr19}/unit (Peak Tariff)</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _ac_card_html(
+            "🤖 RL Controller", _h19_rl_a, _h19_rl_t, _out19,
+            "RL avoids running AC at ₹9/unit when possible",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        _ac_card_html(
+            "📏 Rule-Based", _h19_rule_a, _h19_rule_t, _out19,
+            "Rule: unaware of price — runs AC if temp > 25°C",
+        ),
+        unsafe_allow_html=True,
+    )
 
 # ── hourly AC timeline bars ───────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Hourly AC Decisions · 24 Hours</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="sec-label">Hour-by-Hour AC Decisions — Cyan = RL ON · Orange = Rule ON · Grey = OFF</div>', unsafe_allow_html=True)
 
 def timeline_html(actions, color_class):
     bars = ""
@@ -569,141 +738,118 @@ st.markdown(f"""
   <span><span style="color:{ACCENT}">■</span>&nbsp;RL AC ON</span>
   <span><span style="color:{ACCENT2}">■</span>&nbsp;Rule AC ON</span>
   <span><span style="color:{SURFACE2}">■</span>&nbsp;AC OFF</span>
-  <span style="margin-left:4px;color:{TEXT2}">RL ON: <strong>{rl_ac_hrs}h</strong> / 24 &nbsp;·&nbsp; Rule ON: <strong>{rule_ac_hrs}h</strong> / 24 &nbsp;·&nbsp; RL saved <strong>{abs(saved_hrs)}h</strong> of cooling</span>
+  <span style="margin-left:4px;color:{TEXT2}">
+    RL ran AC for <strong style="color:{ACCENT}">{rl_ac_hrs} hours</strong> out of 24 &nbsp;·&nbsp;
+    Rule-based ran for <strong style="color:{ACCENT2}">{rule_ac_hrs} hours</strong> out of 24 &nbsp;·&nbsp;
+    <strong style="color:{GREEN}">RL used {abs(saved_hrs)} fewer cooling hours</strong>
+  </span>
 </div>
 """, unsafe_allow_html=True)
 
 # ── temperature chart ─────────────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Temperature Comparison · Indoor vs Outdoor</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="sec-label">Indoor Temperature Over 24 Hours — Does RL Keep the Room Cooler?</div>', unsafe_allow_html=True)
 
 hours = list(range(24))
 fig_temp = go.Figure()
 
-fig_temp.add_hrect(y0=22, y1=24, fillcolor=GREEN, opacity=0.06,
-                   line_width=0, annotation_text="Comfort 22–24°C",
-                   annotation_position="top right",
-                   annotation_font=dict(size=10, color=GREEN))
+# Comfort band
+fig_temp.add_hrect(
+    y0=22, y1=24, fillcolor=GREEN, opacity=0.08, line_width=0,
+    annotation_text="Comfort zone 22–24°C",
+    annotation_position="top right",
+    annotation_font=dict(size=10, color=GREEN),
+)
 
+# Outdoor temperature reference
 fig_temp.add_trace(go.Scatter(
-    x=hours, y=OUTDOOR_TEMPS, name="Outdoor",
+    x=hours, y=outdoor_temps_disp, name="Outdoor Temp",
     mode="lines", line=dict(color=MUTED, width=1.5, dash="dot"),
-    fill="tozeroy", fillcolor=f"rgba(74,96,128,0.06)",
+    fill="tozeroy", fillcolor="rgba(74,96,128,0.04)",
 ))
+# Rule-based indoor temperature
 fig_temp.add_trace(go.Scatter(
-    x=hours, y=df_rule["Temp"].tolist(), name="Rule-Based",
-    mode="lines+markers", line=dict(color=ACCENT2, width=2),
-    marker=dict(size=5, color=ACCENT2),
+    x=hours, y=df_rule["Temp"].tolist(), name="Rule-Based Indoor",
+    mode="lines", line=dict(color=ACCENT2, width=2.5),
 ))
+# RL indoor temperature
 fig_temp.add_trace(go.Scatter(
-    x=hours, y=df_rl["Temp"].tolist(), name="RL Controller",
-    mode="lines+markers", line=dict(color=ACCENT, width=2.5),
-    marker=dict(size=5, color=ACCENT),
+    x=hours, y=df_rl["Temp"].tolist(), name="RL Indoor",
+    mode="lines", line=dict(color=ACCENT, width=2.5),
 ))
 
-ac_on_hours = [h for h, a in zip(hours, df_rl["Action"]) if a == "ON"]
-ac_on_temps = [df_rl["Temp"].iloc[h] for h in ac_on_hours]
-fig_temp.add_trace(go.Scatter(
-    x=ac_on_hours, y=ac_on_temps, name="RL AC ON",
-    mode="markers", marker=dict(symbol="triangle-down", size=10, color=ACCENT, opacity=0.8),
-))
+# Mark hours when RL had AC ON (triangle down = cooling event)
+ac_on_rl   = [h for h, a in zip(hours, df_rl["Action"])   if a == "ON"]
+ac_on_rule = [h for h, a in zip(hours, df_rule["Action"]) if a == "ON"]
+if ac_on_rl:
+    fig_temp.add_trace(go.Scatter(
+        x=ac_on_rl, y=[df_rl["Temp"].iloc[h] for h in ac_on_rl],
+        name="RL cooling active",
+        mode="markers", marker=dict(symbol="triangle-down", size=11, color=ACCENT, opacity=0.9),
+    ))
+if ac_on_rule:
+    fig_temp.add_trace(go.Scatter(
+        x=ac_on_rule, y=[df_rule["Temp"].iloc[h] for h in ac_on_rule],
+        name="Rule cooling active",
+        mode="markers", marker=dict(symbol="triangle-down", size=11, color=ACCENT2, opacity=0.9),
+    ))
 
 fig_temp.update_layout(
-    **plotly_cfg(), height=320,
-    xaxis=ax("Hour of day", {"tickvals": list(range(0,24,2))}),
-    yaxis=ax("Temperature (°C)"),
+    **plotly_cfg(), height=360,
+    xaxis=ax("Hour of day", {"tickvals": list(range(0, 24, 2))}),
+    yaxis=ax("Temperature (°C)", {"range": [15, 46]}),
+    title=dict(
+        text="Green band = comfort zone. Triangles show when AC was active. Vellore peak outdoor: 41°C.",
+        font=dict(size=11, color=MUTED), x=0,
+    ),
 )
 st.plotly_chart(fig_temp, use_container_width=True, config={"displayModeBar": False})
 
-# ── cost + price side by side ─────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Cost & Energy Price · Hourly</div>', unsafe_allow_html=True)
+# ── cost vs electricity price (merged) ───────────────────────────────────────
+st.markdown(f'<div class="sec-label">Electricity Spend Per Hour — Does RL Avoid the Expensive Hours?</div>', unsafe_allow_html=True)
 
-col_l, col_r = st.columns(2)
+fig_cost = make_subplots(specs=[[{"secondary_y": True}]])
 
-with col_l:
-    fig_cost = go.Figure()
-    fig_cost.add_trace(go.Bar(
-        x=hours, y=df_rule["Cost"].tolist(), name="Rule Cost",
-        marker_color=ACCENT2, opacity=0.7,
-    ))
-    fig_cost.add_trace(go.Bar(
-        x=hours, y=df_rl["Cost"].tolist(), name="RL Cost",
-        marker_color=ACCENT, opacity=0.9,
-    ))
-    fig_cost.update_layout(
-        **plotly_cfg(), height=240, barmode="group",
-        xaxis=ax("Hour", {"tickvals": list(range(0,24,2))}),
-        yaxis=ax("Cost"),
-        title=dict(text="Hourly cost comparison", font=dict(size=12, color=MUTED), x=0),
-    )
-    st.plotly_chart(fig_cost, use_container_width=True, config={"displayModeBar": False})
+fig_cost.add_trace(go.Bar(
+    x=hours, y=df_rule["Cost"].tolist(), name="Rule-Based Cost",
+    marker_color=ACCENT2, opacity=0.7,
+), secondary_y=False)
+fig_cost.add_trace(go.Bar(
+    x=hours, y=df_rl["Cost"].tolist(), name="RL Cost",
+    marker_color=ACCENT, opacity=0.9,
+), secondary_y=False)
+fig_cost.add_trace(go.Scatter(
+    x=hours, y=price_profile_disp, name="Electricity Price (₹/unit)",
+    mode="lines", line=dict(color=RED, width=2, dash="dot"),
+), secondary_y=True)
 
-with col_r:
-    fig_price = go.Figure()
-    fig_price.add_trace(go.Scatter(
-        x=hours, y=PRICE_PROFILE, name="Energy Price",
-        mode="lines", line=dict(color=ACCENT2, width=2),
-        fill="tozeroy", fillcolor=f"rgba(255,107,53,0.10)",
-    ))
-    peak_hrs = [h for h, p in enumerate(PRICE_PROFILE) if p >= 8]
-    peak_vals = [PRICE_PROFILE[h] for h in peak_hrs]
-    fig_price.add_trace(go.Scatter(
-        x=peak_hrs, y=peak_vals, name="Peak price",
-        mode="markers", marker=dict(color=RED, size=7, symbol="circle"),
-    ))
-    fig_price.update_layout(
-        **plotly_cfg(), height=240,
-        xaxis=ax("Hour", {"tickvals": list(range(0,24,2))}),
-        yaxis=ax("Price per unit"),
-        title=dict(text="Time-of-use electricity price — RL avoids peaks", font=dict(size=12, color=MUTED), x=0),
-    )
-    st.plotly_chart(fig_price, use_container_width=True, config={"displayModeBar": False})
+peak_hrs  = [h for h, p in enumerate(price_profile_disp) if p >= 8]
+peak_vals = [price_profile_disp[h] for h in peak_hrs]
+fig_cost.add_trace(go.Scatter(
+    x=peak_hrs, y=peak_vals, name="Peak hours",
+    mode="markers", marker=dict(color=RED, size=8, symbol="circle"),
+    showlegend=False,
+), secondary_y=True)
 
-# ── cumulative reward ─────────────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Cumulative Reward · RL vs Rule-Based</div>', unsafe_allow_html=True)
-
-fig_rew = go.Figure()
-fig_rew.add_trace(go.Scatter(
-    x=hours, y=df_rule["Reward"].cumsum().tolist(), name="Rule-Based",
-    mode="lines", line=dict(color=ACCENT2, width=2, dash="dash"),
-    fill="tozeroy", fillcolor="rgba(255,107,53,0.05)",
-))
-fig_rew.add_trace(go.Scatter(
-    x=hours, y=df_rl["Reward"].cumsum().tolist(), name="RL Controller",
-    mode="lines", line=dict(color=ACCENT, width=2.5),
-    fill="tozeroy", fillcolor="rgba(0,212,255,0.07)",
-))
-fig_rew.add_hline(y=0, line_color=MUTED, line_width=0.8, line_dash="dot")
-fig_rew.update_layout(
-    **plotly_cfg(), height=260,
-    xaxis=ax("Hour of day", {"tickvals": list(range(0,24,2))}),
-    yaxis=ax("Cumulative reward"),
-    annotations=[dict(x=23, y=df_rl["Reward"].cumsum().iloc[-1],
-                      text=f"RL: {df_rl['Reward'].cumsum().iloc[-1]:.1f}",
-                      showarrow=False, font=dict(color=ACCENT, size=11), xanchor="right")],
+_base = plotly_cfg()
+fig_cost.update_layout(
+    **_base, height=300, barmode="group",
+    xaxis =ax("Hour of day", {"tickvals": list(range(0, 24, 2))}),
+    title=dict(
+        text="Bars = ₹ spent each hour (cyan = RL, orange = Rule-based)  ·  Dotted line = tariff rate  ·  Red dots = peak ₹9/unit hours",
+        font=dict(size=11, color=MUTED), x=0,
+    ),
 )
-st.plotly_chart(fig_rew, use_container_width=True, config={"displayModeBar": False})
-st.caption("Reward is always negative — the agent tries to get as close to 0 as possible. Higher = better.")
-
-# ── discomfort ────────────────────────────────────────────────────────────────
-st.markdown(f'<div class="sec-label">Discomfort Score · Hourly</div>', unsafe_allow_html=True)
-
-fig_dis = go.Figure()
-fig_dis.add_trace(go.Bar(
-    x=hours, y=df_rule["Discomfort"].tolist(), name="Rule-Based",
-    marker_color=ACCENT2, opacity=0.6,
-))
-fig_dis.add_trace(go.Bar(
-    x=hours, y=df_rl["Discomfort"].tolist(), name="RL Controller",
-    marker_color=ACCENT, opacity=0.85,
-))
-fig_dis.update_layout(
-    **plotly_cfg(), height=220, barmode="group",
-    xaxis=ax("Hour", {"tickvals": list(range(0,24,2))}),
-    yaxis=ax("Discomfort units"),
-    title=dict(text="0 = perfectly comfortable (22–24°C). Higher = worse.",
-               font=dict(size=12, color=MUTED), x=0),
+fig_cost.update_yaxes(
+    title_text="Cost (₹)", secondary_y=False,
+    gridcolor=BORDER, tickfont=dict(size=11, family=FONT_MONO, color=TEXT2),
+    title_font=dict(size=11, color=TEXT2),
 )
-st.plotly_chart(fig_dis, use_container_width=True, config={"displayModeBar": False})
+fig_cost.update_yaxes(
+    title_text="Price (₹/unit)", secondary_y=True,
+    showgrid=False, tickfont=dict(size=11, family=FONT_MONO, color=TEXT2),
+    title_font=dict(size=11, color=TEXT2),
+)
+st.plotly_chart(fig_cost, use_container_width=True, config={"displayModeBar": False})
 
 # ── raw data ──────────────────────────────────────────────────────────────────
 with st.expander("📋  Raw Hourly Data"):
